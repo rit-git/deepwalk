@@ -12,11 +12,17 @@ from glob import glob
 from six.moves import range, zip, zip_longest
 from six import iterkeys
 from collections import defaultdict, Iterable
+from multiprocessing import cpu_count
 import random
 from random import shuffle
 from itertools import product,permutations
 from scipy.io import loadmat
 from scipy.sparse import issparse
+
+from concurrent.futures import ProcessPoolExecutor
+
+from multiprocessing import Pool
+from multiprocessing import cpu_count
 
 logger = logging.getLogger("deepwalk")
 
@@ -27,7 +33,7 @@ __email__ = "bperozzi@cs.stonybrook.edu"
 LOGFORMAT = "%(asctime).19s %(levelname)s %(filename)s: %(lineno)s %(message)s"
 
 class Graph(defaultdict):
-  """Efficient basic implementation of nx `Graph' â€“ Undirected graphs with self loops"""  
+  """Efficient basic implementation of nx `Graph' â€“ Undirected graphs with self loops"""
   def __init__(self):
     super(Graph, self).__init__(list)
 
@@ -39,22 +45,22 @@ class Graph(defaultdict):
 
   def subgraph(self, nodes={}):
     subgraph = Graph()
-    
+
     for n in nodes:
       if n in self:
         subgraph[n] = [x for x in self[n] if x in nodes]
-        
+
     return subgraph
 
   def make_undirected(self):
-  
+
     t0 = time()
 
     for v in self.keys():
       for other in self[v]:
         if v != other:
           self[other].append(v)
-    
+
     t1 = time()
     logger.info('make_directed: added missing edges {}s'.format(t1-t0))
 
@@ -65,7 +71,7 @@ class Graph(defaultdict):
     t0 = time()
     for k in iterkeys(self):
       self[k] = list(sorted(set(self[k])))
-    
+
     t1 = time()
     logger.info('make_consistent: made consistent in {}s'.format(t1-t0))
 
@@ -79,10 +85,10 @@ class Graph(defaultdict):
     t0 = time()
 
     for x in self:
-      if x in self[x]: 
+      if x in self[x]:
         self[x].remove(x)
         removed += 1
-    
+
     t1 = time()
 
     logger.info('remove_self_loops: removed {} loops in {}s'.format(removed, (t1-t0)))
@@ -93,7 +99,7 @@ class Graph(defaultdict):
       for y in self[x]:
         if x == y:
           return True
-    
+
     return False
 
   def has_edge(self, v1, v2):
@@ -109,7 +115,7 @@ class Graph(defaultdict):
 
   def order(self):
     "Returns the number of nodes in the graph"
-    return len(self)    
+    return len(self)
 
   def number_of_edges(self):
     "Returns the number of nodes in the graph"
@@ -117,32 +123,68 @@ class Graph(defaultdict):
 
   def number_of_nodes(self):
     "Returns the number of nodes in the graph"
-    return self.order()
+    return order()
 
-  def random_walk(self, path_length, alpha=0, rand=random.Random(), start=None):
+  def random_walk(self, path_length, alpha=0, rand=random, start=None):
     """ Returns a truncated random walk.
 
         path_length: Length of the random walk.
         alpha: probability of restarts.
         start: the start node of the random walk.
     """
+    #rand.seed(10)
+
     G = self
     if start:
       path = [start]
     else:
       # Sampling is uniform w.r.t V, and not w.r.t E
-      path = [rand.choice(list(G.keys()))]
+      path = [rand.choice(G.keys())]
 
     while len(path) < path_length:
       cur = path[-1]
       if len(G[cur]) > 0:
         if rand.random() >= alpha:
-          path.append(rand.choice(G[cur]))
+
+          neighbors = G[cur]
+
+          if len(neighbors) == 1:
+            path.append(neighbors[0])
+            continue
+
+          #-- with weights
+          if G.is_weighted:
+
+            #target_list = []
+            accumulated_weight_list = []
+            total_weight = 0.
+            for n in neighbors:
+              #target_list.append(n)
+              total_weight += G.weight[cur][n]
+              accumulated_weight_list.append(total_weight)
+            accumulated_weight_list = [w/total_weight for w in accumulated_weight_list]
+
+          #-- without weights
+          else:
+            # target = rand.choice(neighbors)
+            n_neighbors = len(neighbors)
+            total_weight = float( n_neighbors )
+            accumulated_weight_list = [ i/total_weight for i in range( 1,n_neighbors+1 ) ]
+
+          #-- make choice base on accumulated_weight_list
+          r = rand.random()
+          #print(r)
+          for target, accumulated_weight in zip(neighbors, accumulated_weight_list):
+            if r <= accumulated_weight:
+              path.append(target)
+              break
+
         else:
           path.append(path[0])
       else:
         break
-    return [str(node) for node in path]
+
+    return path
 
 # TODO add build_walks in here
 
@@ -151,12 +193,12 @@ def build_deepwalk_corpus(G, num_paths, path_length, alpha=0,
   walks = []
 
   nodes = list(G.nodes())
-  
+
   for cnt in range(num_paths):
     rand.shuffle(nodes)
     for node in nodes:
       walks.append(G.random_walk(path_length, rand=rand, alpha=alpha, start=node))
-  
+
   return walks
 
 def build_deepwalk_corpus_iter(G, num_paths, path_length, alpha=0,
@@ -188,7 +230,7 @@ def parse_adjacencylist(f):
       row = [introw[0]]
       row.extend(set(sorted(introw[1:])))
       adjlist.extend([row])
-  
+
   return adjlist
 
 def parse_adjacencylist_unchecked(f):
@@ -196,7 +238,7 @@ def parse_adjacencylist_unchecked(f):
   for l in f:
     if l and l[0] != "#":
       adjlist.extend([[int(x) for x in l.strip().split()]])
-  
+
   return adjlist
 
 def load_adjacencylist(file_, undirected=False, chunksize=10000, unchecked=True):
@@ -211,13 +253,14 @@ def load_adjacencylist(file_, undirected=False, chunksize=10000, unchecked=True)
   adjlist = []
 
   t0 = time()
-  
-  total = 0 
+
   with open(file_) as f:
-    for idx, adj_chunk in enumerate(map(parse_func, grouper(int(chunksize), f))):
-      adjlist.extend(adj_chunk)
-      total += len(adj_chunk)
-  
+    with ProcessPoolExecutor(max_workers=cpu_count()) as executor:
+      total = 0
+      for idx, adj_chunk in enumerate(executor.map(parse_func, grouper(int(chunksize), f))):
+          adjlist.extend(adj_chunk)
+          total += len(adj_chunk)
+
   t1 = time()
 
   logger.info('Parsed {} edges with {} chunks in {}s'.format(total, idx, t1-t0))
@@ -234,21 +277,53 @@ def load_adjacencylist(file_, undirected=False, chunksize=10000, unchecked=True)
     t1 = time()
     logger.info('Made graph undirected in {}s'.format(t1-t0))
 
-  return G 
+  return G
 
 
-def load_edgelist(file_, undirected=True):
+def load_edgelist(file_, undirected=False, weighted=False):
+  print '呼んだよ'
   G = Graph()
+  #G.weight = defaultdict()
+  G.weight = defaultdict( defaultdict )
+  G.is_weighted = weighted
+
   with open(file_) as f:
     for l in f:
-      x, y = l.strip().split()[:2]
-      x = int(x)
-      y = int(y)
-      G[x].append(y)
-      if undirected:
-        G[y].append(x)
-  
+
+      words = l.strip().split()
+      n_words = len(words)
+
+      if n_words <= 1:
+        x = words[0]
+        x = int(x)
+        G[x] = []
+        if undirected:
+          # direction and weights are not well defined
+          pass
+
+      else:
+        if weighted:
+          x, y, w = words[:3]
+        else:
+          x, y = words[:2]
+
+        x = int(x)
+        y = int(y)
+
+        G[x].append(y)
+
+        if undirected:
+          #if x not in G[y]: # we do not need this because we have G.make_consistent() --> remove duplicate and then sort list
+          G[y].append(x)
+          if weighted:
+            G.weight[x][y] = float(w)
+            G.weight[y][x] = float(w)
+        else:
+          if weighted:
+            G.weight[x][y] = float(w)
+
   G.make_consistent()
+
   return G
 
 
@@ -262,7 +337,7 @@ def load_matfile(file_, variable_name="network", undirected=True):
 def from_networkx(G_input, undirected=True):
     G = Graph()
 
-    for idx, x in enumerate(G_input.nodes()):
+    for idx, x in enumerate(G_input.nodes_iter()):
         for y in iterkeys(G_input[x]):
             G[x].append(y)
 
@@ -291,7 +366,7 @@ def from_numpy(x, undirected=True):
 
 def from_adjlist(adjlist):
     G = Graph()
-    
+
     for row in adjlist:
         node = row[0]
         neighbors = row[1:]
@@ -302,12 +377,10 @@ def from_adjlist(adjlist):
 
 def from_adjlist_unchecked(adjlist):
     G = Graph()
-    
+
     for row in adjlist:
         node = row[0]
         neighbors = row[1:]
         G[node] = neighbors
 
     return G
-
-
