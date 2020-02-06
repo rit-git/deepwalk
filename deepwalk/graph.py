@@ -281,9 +281,9 @@ def load_adjacencylist(file_, undirected=False, chunksize=10000, unchecked=True)
 
 
 def load_edgelist(file_, undirected=False, weighted=False):
-  print '呼んだよ'
+  # print '呼んだよ'
   G = Graph()
-  #G.weight = defaultdict()
+  # G.weight = defaultdict()
   G.weight = defaultdict( defaultdict )
   G.is_weighted = weighted
 
